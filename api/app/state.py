@@ -108,3 +108,27 @@ def update_job(job_id: int, **fields) -> None:
     fields["updated_at"] = now()
     cols = ", ".join(f"{k}=?" for k in fields)
     execute(f"UPDATE jobs SET {cols} WHERE id=?", (*fields.values(), job_id))
+
+
+def ready_if_not_cancelled(job_id: int, **fields) -> bool:
+    """仅在取消未受理（cancel_requested=0）时把任务置为 ready。
+
+    原子条件更新，杜绝"取消已受理但任务仍被发布为 ready"的竞态：
+    返回 True 表示就绪发布成功；False 表示取消抢先，调用方必须转入取消清理。
+    """
+    if not fields:
+        fields = {}
+    fields["status"] = "ready"
+    fields["updated_at"] = now()
+    cols = ", ".join(f"{k}=?" for k in fields)
+    with _LOCK:
+        con = _connect()
+        try:
+            cur = con.execute(
+                f"UPDATE jobs SET {cols} WHERE id=? AND cancel_requested=0",
+                (*fields.values(), job_id),
+            )
+            con.commit()
+            return cur.rowcount == 1
+        finally:
+            con.close()

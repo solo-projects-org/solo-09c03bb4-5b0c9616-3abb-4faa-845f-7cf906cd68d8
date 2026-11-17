@@ -9,6 +9,7 @@
 """
 import os
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -22,6 +23,29 @@ from .walutil import lsn_to_int, wal_file_name
 
 class Cancelled(Exception):
     """任务被用户取消。"""
+
+
+# 恢复实例（start/stop）串行化锁：同一端口同一时刻只允许一个生命周期动作
+_instance_lock = threading.RLock()
+
+
+def _wait_port_free(timeout: float = 90.0) -> None:
+    """阻塞确认恢复端口已释放。
+
+    取消/失败/取代的清理结束前不放行下一项恢复占用同一端口；
+    端口仍被占用时超时抛出，调用方据此让任务失败而不是抢端口启动。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            if s.connect_ex((config.RECOVERY_HOST, config.RECOVERY_PORT)) != 0:
+                return
+        time.sleep(0.5)
+    raise RuntimeError(
+        f"恢复端口 {config.RECOVERY_HOST}:{config.RECOVERY_PORT} 在 {timeout:.0f}s 内未释放，"
+        "拒绝启动新的恢复实例"
+    )
 
 
 # ---------------------------------------------------------------- 调度
@@ -49,22 +73,33 @@ def dispatch_loop(stop: threading.Event) -> None:
 def resume_after_restart() -> None:
     """API 重启后的状态修复。
 
-    - 进行中的任务：重新排队，按原核对点从头重试（幂等，数据目录会重建）；
+    - 取消已受理的进行中任务：**不清除取消意图**，停止遗留实例后如实置 cancelled，
+      绝不会因重启而重新排队、重新开放查询；
+    - 其余进行中任务：重新排队，按原核对点从头重试（幂等，数据目录会重建）；
     - 已 ready 的任务：数据目录仍在，直接拉起实例继续提供只读查询。
     """
     active = ",".join(f"'{s}'" for s in state.ACTIVE_JOB_STATES)
     for j in state.all_rows(f"SELECT * FROM jobs WHERE status IN ({active})"):
         if j.get("data_dir"):
-            stop_instance(j["data_dir"])  # 防御：进程一般已随重启消失
-        state.update_job(j["id"], status="queued", cancel_requested=0,
-                         detail="API 重启，按原核对点自动重试")
+            # 防御：API 被 kill 时恢复实例可能仍是孤儿进程，先停掉并等端口释放
+            stop_instance(j["data_dir"])
+        if j["cancel_requested"]:
+            # 未完成的取消在重启后继续完成，绝不重新排队
+            state.update_job(j["id"], status="cancelled",
+                             detail="取消在 API 重启前已受理，重启后完成清理",
+                             error=None)
+        else:
+            state.update_job(j["id"], status="queued",
+                             detail="API 重启，按原核对点自动重试")
     for j in state.all_rows("SELECT * FROM jobs WHERE status='ready'"):
         try:
             ddir = j["data_dir"]
             if not (ddir and os.path.isdir(ddir)):
                 raise RuntimeError("恢复实例数据目录已不存在")
             if not _postgres_alive(ddir):
-                _pg_ctl(ddir, "start", os.path.join(ddir, "server.log"))
+                with _instance_lock:
+                    _wait_port_free()
+                    _pg_ctl(ddir, "start", os.path.join(ddir, "server.log"))
             with _control_conn() as con:
                 con.execute("SELECT 1")
             state.update_job(j["id"], detail="API 重启后实例已重新拉起，可继续只读查询")
@@ -135,23 +170,37 @@ def run_job(job_id: int) -> None:
 
         # 4) 启动实例，WAL 重放到核对点自动暂停
         state.update_job(job_id, status="recovering", detail="WAL 重放中")
-        _pg_ctl(ddir, "start", logfile)
+        # 端口闸门：清理未结束（上一实例仍占端口）不放行本次启动
+        with _instance_lock:
+            _wait_port_free()
+            _pg_ctl(ddir, "start", logfile)
         started_pg = True
         _wait_replay_paused(job_id, cp, ddir)
 
         # 5) 校验确实停在核对点（杜绝半库报成功），随后 promote 并核查只读
+        _check_cancel(job_id)
         state.update_job(job_id, status="verifying", detail="校验恢复位点并提升")
-        rows = _verify_and_promote(cp, ddir)
-        state.update_job(job_id, status="ready",
-                         detail=f"恢复完成，目标库只读，samples 现有 {rows} 行",
-                         ready_at=state.now(), error=None, log_tail=None)
+        rows = _verify_and_promote(cp, ddir, job_id)
+        _check_cancel(job_id)  # 提升窗口内受理的取消同样生效，绝不带取消发布 ready
+        # 原子交接：仅当取消未受理才允许发布 ready（CAS 兜底并发竞态）
+        published = state.ready_if_not_cancelled(
+            job_id,
+            detail=f"恢复完成，目标库只读，samples 现有 {rows} 行",
+            ready_at=state.now(), error=None, log_tail=None,
+        )
+        if not published:
+            raise Cancelled()
     except Cancelled:
+        # 取消一经受理：任务不得作为 ready 开放查询，已启动的实例必须退出
         if started_pg:
-            stop_instance(ddir)
-        state.update_job(job_id, status="cancelled", detail="已取消")
+            with _instance_lock:
+                stop_instance(ddir)  # 内含端口释放确认
+        state.update_job(job_id, status="cancelled", ready_at=None,
+                         detail="已取消：实例已退出，未开放目标查询", error=None)
     except Exception as e:  # noqa: BLE001 - 任何失败都如实标记，绝不上报成功
         if started_pg:
-            stop_instance(ddir)
+            with _instance_lock:
+                stop_instance(ddir)  # 内含端口释放确认
         state.update_job(job_id, status="failed", error=str(e)[-4000:],
                          log_tail=_tail(logfile) if os.path.exists(logfile) else None)
 
@@ -225,7 +274,7 @@ def _wait_replay_paused(job_id: int, cp: dict, ddir: str) -> None:
     )
 
 
-def _verify_and_promote(cp: dict, ddir: str) -> int:
+def _verify_and_promote(job_id: int, cp: dict, ddir: str) -> int:
     target = lsn_to_int(cp["restore_lsn"])
     with _control_conn() as con:
         in_rec, _paused, last = con.execute(
@@ -238,10 +287,12 @@ def _verify_and_promote(cp: dict, ddir: str) -> int:
             raise RuntimeError(
                 f"校验失败：重放位点 {last or '-'} 未到达核对点 {cp['restore_lsn']}"
             )
+        _check_cancel(job_id)  # 停在核对点上、恢复重放前最后一次取消机会
         con.execute("SELECT pg_wal_replay_resume()")
     # 等待 promote 完成
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
+        _check_cancel(job_id)  # promote 窗口内受理的取消也要生效
         if not _postgres_alive(ddir):
             raise RuntimeError("promote 期间实例退出")
         try:
@@ -265,35 +316,44 @@ def _verify_and_promote(cp: dict, ddir: str) -> int:
 # ---------------------------------------------------------------- 实例管理
 
 def stop_instance(ddir: str) -> None:
-    """尽力停止恢复实例（供取代/取消/关停调用）。"""
+    """尽力停止恢复实例（供取代/取消/关停调用）。
+
+    停止成功后还会确认端口已释放，保证清理结束前不放行下一项恢复占用同一端口。
+    """
     if not ddir or not os.path.isdir(ddir):
         return
-    try:
-        subprocess.run(
-            ["pg_ctl", "-D", ddir, "-m", "fast", "-w", "-t", "60", "stop"],
-            capture_output=True, text=True, timeout=90,
-        )
-        return
-    except Exception:
-        pass
-    try:
-        with open(os.path.join(ddir, "postmaster.pid")) as f:
-            pid = int(f.readline().strip())
-        os.kill(pid, 15)
-        for _ in range(30):
-            time.sleep(1)
-            if not _pid_alive(pid):
-                return
-        os.kill(pid, 9)
-    except Exception:
-        pass
+    with _instance_lock:
+        try:
+            subprocess.run(
+                ["pg_ctl", "-D", ddir, "-m", "fast", "-w", "-t", "60", "stop"],
+                capture_output=True, text=True, timeout=90,
+            )
+        except Exception:
+            try:
+                with open(os.path.join(ddir, "postmaster.pid")) as f:
+                    pid = int(f.readline().strip())
+                os.kill(pid, 15)
+                for _ in range(30):
+                    time.sleep(1)
+                    if not _pid_alive(pid):
+                        break
+                else:
+                    os.kill(pid, 9)
+            except Exception:
+                pass
+        # 进程已发停，确认端口真正释放，避免下一实例抢端口启动
+        try:
+            _wait_port_free()
+        except RuntimeError:
+            pass
 
 
 def _supersede_ready(current_job_id: int) -> None:
     for j in state.all_rows("SELECT * FROM jobs WHERE status='ready'"):
-        if j.get("data_dir"):
-            stop_instance(j["data_dir"])
-            shutil.rmtree(j["data_dir"], ignore_errors=True)
+        with _instance_lock:
+            if j.get("data_dir"):
+                stop_instance(j["data_dir"])
+                shutil.rmtree(j["data_dir"], ignore_errors=True)
         state.update_job(j["id"], status="superseded",
                          detail=f"被恢复任务 #{current_job_id} 取代（一次只恢复一项）")
 

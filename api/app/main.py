@@ -95,7 +95,7 @@ async def lifespan(_app: FastAPI):
     _stop.set()
     for j in state.all_rows(
         "SELECT * FROM jobs WHERE status IN"
-        " ('preparing','recovering','verifying','ready')"
+        " ('queued','waiting_wal','preparing','recovering','verifying','ready')"
     ):
         if j.get("data_dir"):
             recoverer.stop_instance(j["data_dir"])

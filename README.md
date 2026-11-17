@@ -58,7 +58,10 @@ Swagger 文档：<http://localhost:8000/docs>
 | 不用源库冒充恢复 | 查询连接的是 `/recoveries/job-N` 下独立实例（端口 55433），响应中标注实例与 as-of LSN |
 | WAL 未齐备显示等待 | 核对点 `waiting_wal` 状态；任务逐段核对"备份起点→核对点"全部 WAL 段，缺段时停留 `waiting_wal` 并列出缺失段 |
 | 不把半库报成功 | pause 后校验 `pg_last_wal_replay_lsn() >= 核对点 LSN` 才 promote；再查 `samples`  sanity + `default_transaction_read_only=on` 才置 `ready`；任何异常 → `failed` + 日志 |
-| 失败/重启可重试 | 任务状态落 SQLite；`POST /api/recoveries/{id}/retry` 按原点重试；API 重启时进行中任务自动重新排队、ready 实例自动拉起 |
+| 取消受理后绝不变 ready | 校验/提升（promote）全程检查取消；就绪发布走条件更新 `WHERE cancel_requested=0`（CAS），取消抢先则发布失败并转入清理：任务终态只能是 `cancelled`，已启动实例退出，目标查询始终 409 |
+| 重启不丢取消 | 取消意图落 SQLite 且重启不会清除：重启后进行中且 `cancel_requested=1` 的任务停止遗留实例并置 `cancelled`，绝不重新排队/拉起 |
+| 清理未结束不占用端口 | 实例 start/stop 经同一把生命周期锁串行；启动前与停止后都探测 55433 端口释放，端口未释放时新任务拒绝启动并如实 `failed`，不会抢端口 |
+| 失败/重启可重试 | 任务状态落 SQLite；`POST /api/recoveries/{id}/retry` 按原点重试；API 重启时普通进行中任务自动重新排队、ready 实例自动拉起 |
 | 一次只恢复一项 | 有进行中任务时 `POST /api/recoveries` 返回 409；新任务就绪前会把旧 ready 实例停掉并标记 `superseded` |
 | 源库可写、不被改写 | 基准备份/恢复点均为在线只读操作；API 对源库不执行任何 DML；归档卷对 API 只读挂载 |
 
@@ -84,8 +87,14 @@ Swagger 文档：<http://localhost:8000/docs>
 queued → waiting_wal → preparing → recovering → verifying → ready
            (等待WAL归档齐备)                            ↘ failed（可 retry）
 ready --(新任务就绪前)--> superseded        ready --(DELETE)--> stopped
-进行中 --(DELETE)--> cancelled             API 重启：进行中→重新排队；ready→自动拉起
+进行中 --(DELETE: 置 cancel_requested=1)──▶ 各阶段检查点生效
+        └─▶ cancelled（实例退出、端口释放确认、绝不发布 ready；可 retry）
+API 重启：普通进行中→重新排队；cancel_requested=1→继续完成取消；ready→自动拉起
 ```
+
+> 取消一经 `DELETE` 受理即持久化（`cancel_requested=1`）：即便取消发生在
+> 校验/提升阶段、或 API 在清理完成前重启，任务最终都不会以 `ready` 开放查询，
+> 已启动的恢复实例必须退出且端口释放确认后，下一项恢复才能启动。
 
 ## 手动操作示例（curl）
 
@@ -127,3 +136,11 @@ curl -s 'localhost:8000/api/recoveries/1/samples?station_no=ST-02'
 - 并发第二个恢复请求返回 409；新任务就绪时旧实例被 `superseded`；
 - 恢复实例直连写入被数据库拒绝（read-only transaction），`/query` 非 SELECT 与多语句被 400 拦截；
 - 强制重做基准备份后旧核对点自动 `expired`，恢复过期核对点返回 409。
+
+### 取消/重启/端口交接回归（`tests/`，标准库可直接 `python3 -I tests/...` 运行）
+
+- 取消在**校验/提升阶段**受理（含 promote 等待窗口）→ 任务终态 `cancelled`、不发布 `ready`、实例被停止、查询持续 409；
+- 就绪发布的 CAS 条件更新：`cancel_requested=1` 时发布必失败，取消与 ready 不存在竞态胜出窗口；
+- 取消受理后模拟重启 → 取消标记保留、任务不重新排队，遗留实例停止后置 `cancelled`；普通进行中任务重启仍重新排队；
+- 端口未释放时下一项恢复被闸门拦截并 `failed`，端口释放后重试可正常 `ready`；
+- 取消/失败后按原核对点重试成功；接口层各非 `ready` 状态查询均 409；源库模块 AST 校验无任何写操作 SQL。
